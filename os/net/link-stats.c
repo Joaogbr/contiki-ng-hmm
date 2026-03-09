@@ -1,0 +1,393 @@
+/*
+ * Copyright (c) 2015, SICS Swedish ICT.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the Institute nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE INSTITUTE AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE INSTITUTE OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ *
+ *
+ * Authors: Simon Duquennoy <simonduq@sics.se>
+ *          Atis Elsts <atis.elsts@edi.lv>
+ */
+
+#include "contiki.h"
+#include "sys/clock.h"
+#include "net/packetbuf.h"
+#include "net/nbr-table.h"
+#include "net/link-stats.h"
+#include "lib/link-features.h"
+#include "lib/ema.h"
+#include <stdio.h>
+
+/* Log configuration */
+#include "sys/log.h"
+#define LOG_MODULE "Link Stats"
+#define LOG_LEVEL LOG_LEVEL_LS
+
+/* Maximum value for the Tx count counter */
+#define TX_COUNT_MAX                    32
+
+/* EWMA (exponential moving average) used to maintain statistics over time */
+#define EWMA_SCALE                     100
+#define EWMA_ALPHA                      10
+#define EWMA_BOOTSTRAP_ALPHA            25
+
+#define EMA_TAU_ETX                     60.0f /* Seconds */
+#define EMA_BOOTSTRAP_TAU_ETX           20.0f /* Seconds */
+#define EMA_TAU_RSSI                    10.0f /* Seconds */
+
+/* ETX fixed point divisor. 128 is the value used by RPL (RFC 6551 and RFC 6719) */
+#define ETX_DIVISOR                     LINK_STATS_ETX_DIVISOR
+/* In case of no-ACK, add ETX_NOACK_PENALTY to the real Tx count, as a penalty */
+#define ETX_NOACK_PENALTY               12
+/* Initial ETX value */
+#define ETX_DEFAULT                      2
+
+#define RSSI_DIFF (LINK_STATS_RSSI_HIGH - LINK_STATS_RSSI_LOW)
+
+/* Generate error on incorrect link stats configuration values */
+#if RSSI_DIFF <= 0
+#error "RSSI_HIGH must be greater then RSSI_LOW"
+#endif
+
+/* Generate error if the initial ETX calculation would overflow uint16_t */
+#if ETX_DIVISOR * RSSI_DIFF >= 0x10000
+#error "RSSI math overflow"
+#endif
+
+/* Per-neighbor link statistics table */
+NBR_TABLE(struct link_stats, link_stats);
+
+/* Called at a period of FRESHNESS_HALF_LIFE */
+struct ctimer periodic_timer;
+
+/*---------------------------------------------------------------------------*/
+/* Returns the neighbor's link stats */
+const struct link_stats *
+link_stats_from_lladdr(const linkaddr_t *lladdr)
+{
+  return nbr_table_get_from_lladdr(link_stats, lladdr);
+}
+/*---------------------------------------------------------------------------*/
+/* Returns the neighbor's address given a link stats item */
+const linkaddr_t *
+link_stats_get_lladdr(const struct link_stats *stat)
+{
+  return nbr_table_get_lladdr(link_stats, stat);
+}
+/*---------------------------------------------------------------------------*/
+/* Are the statistics fresh? */
+int
+link_stats_is_fresh(const struct link_stats *stats)
+{
+  return (stats != NULL)
+      && clock_time() - stats->last_tx_time < FRESHNESS_EXPIRATION_TIME
+      && stats->freshness >= FRESHNESS_TARGET;
+}
+/*---------------------------------------------------------------------------*/
+#if LINK_STATS_INIT_ETX_FROM_RSSI
+/*
+ * Returns initial ETX value from an RSSI value.
+ *    RSSI >= RSSI_HIGH           -> use default ETX
+ *    RSSI_LOW < RSSI < RSSI_HIGH -> ETX is a linear function of RSSI
+ *    RSSI <= RSSI_LOW            -> use minimal initial ETX
+ **/
+static uint16_t
+guess_etx_from_rssi(const struct link_stats *stats)
+{
+  if(stats != NULL) {
+    if(stats->rssi[0] == LINK_STATS_RSSI_UNKNOWN) {
+      return ETX_DEFAULT * ETX_DIVISOR;
+    } else {
+      const int16_t rssi_delta = stats->rssi[0] - LINK_STATS_RSSI_LOW;
+      const int16_t bounded_rssi_delta = BOUND(rssi_delta, 0, RSSI_DIFF);
+      /* Penalty is in the range from 0 to ETX_DIVISOR */
+      const uint16_t penalty = ETX_DIVISOR * bounded_rssi_delta / RSSI_DIFF;
+      /* ETX is the default ETX value + penalty */
+      const uint16_t etx = ETX_DIVISOR * ETX_DEFAULT + penalty;
+      return MIN(etx, LINK_STATS_ETX_INIT_MAX * ETX_DIVISOR);
+    }
+  }
+  return 0xffff;
+}
+#endif /* LINK_STATS_INIT_ETX_FROM_RSSI */
+/*---------------------------------------------------------------------------*/
+/* Initialize values from link_stats */
+static void initialize_stats(struct link_stats *stats)
+{
+  for(uint8_t i = 0; i < LINK_STATS_RSSI_ARR_LEN; i++) {
+    stats->rssi[i] = LINK_STATS_RSSI_UNKNOWN;
+    stats->rx_time[i] = 0;
+  }
+  LINK_STATS_FEATURES.link_features_on_stats_init(stats);
+}
+/*---------------------------------------------------------------------------*/
+/* Packet sent callback. Updates stats for transmissions to lladdr */
+void
+link_stats_packet_sent(const linkaddr_t *lladdr, int status, int numtx)
+{
+  struct link_stats *stats;
+#if !LINK_STATS_ETX_FROM_PACKET_COUNT
+  uint16_t packet_etx;
+#endif /* !LINK_STATS_ETX_FROM_PACKET_COUNT */
+
+  if(status != MAC_TX_OK && status != MAC_TX_NOACK && status != MAC_TX_QUEUE_FULL) {
+    /* Do not penalize the ETX when collisions or transmission errors occur. */
+    return;
+  }
+
+  stats = nbr_table_get_from_lladdr(link_stats, lladdr);
+  if(stats == NULL) {
+    /* If transmission failed, do not add the neighbor, as the neighbor might not exist anymore */
+    if(status != MAC_TX_OK) {
+      return;
+    }
+
+    /* Add the neighbor */
+    stats = nbr_table_add_lladdr(link_stats, lladdr, NBR_TABLE_REASON_LINK_STATS, NULL);
+    if(stats == NULL) {
+      return; /* No space left, return */
+    }
+    initialize_stats(stats);
+  }
+
+  if(status == MAC_TX_QUEUE_FULL) {
+#if LINK_STATS_PACKET_COUNTERS
+    stats->cnt_current.num_queue_drops += 1;
+#endif
+    /* Do not penalize the ETX when the packet is dropped due to a full queue */
+    return;
+  }
+
+  /* Update last timestamp and freshness */
+  clock_time_t curr_time = clock_time();
+  stats->freshness = MIN(stats->freshness + numtx, FRESHNESS_MAX);
+
+#if LINK_STATS_PACKET_COUNTERS
+  /* Update paket counters */
+  stats->cnt_current.num_packets_tx += numtx;
+  if(status == MAC_TX_OK) {
+    stats->cnt_current.num_packets_acked++;
+  }
+#endif
+
+  /* Add penalty in case of no-ACK */
+  if(status == MAC_TX_NOACK) {
+    numtx += ETX_NOACK_PENALTY;
+  }
+
+#if LINK_STATS_ETX_FROM_PACKET_COUNT
+  /* Compute ETX from packet and ACK count */
+  /* Halve both counter after TX_COUNT_MAX */
+  if(stats->tx_count + numtx > TX_COUNT_MAX) {
+    stats->tx_count /= 2;
+    stats->ack_count /= 2;
+  }
+  /* Update tx_count and ack_count */
+  stats->tx_count += numtx;
+  if(status == MAC_TX_OK) {
+    stats->ack_count++;
+  }
+  /* Compute ETX */
+  if(stats->ack_count > 0) {
+    stats->etx = ((uint16_t)stats->tx_count * ETX_DIVISOR) / stats->ack_count;
+  } else {
+    stats->etx = (uint16_t)MAX(ETX_NOACK_PENALTY, stats->tx_count) * ETX_DIVISOR;
+  }
+#else /* LINK_STATS_ETX_FROM_PACKET_COUNT */
+  /* Compute ETX using an EWMA */
+
+  /* ETX used for this update */
+  packet_etx = numtx * ETX_DIVISOR;
+  if(stats->etx == 0) {
+    /* Initialize ETX */
+    stats->etx = packet_etx;
+  } else {
+#if LINK_STATS_ETX_WITH_EMANEXT
+    /* Update ETX using EMAnext */
+    float diff_s = (float) (curr_time - stats->last_tx_time) / CLOCK_SECOND;
+    float tau = link_stats_is_fresh(stats) ? EMA_TAU_ETX : EMA_BOOTSTRAP_TAU_ETX;
+    stats->etx = (uint16_t) emanext((float) stats->etx, (float) packet_etx, diff_s, tau);
+#else
+    /* ETX alpha used for this update */
+    uint8_t ewma_alpha = link_stats_is_fresh(stats) ? EWMA_ALPHA : EWMA_BOOTSTRAP_ALPHA;
+    /* Compute EWMA and update ETX */
+    stats->etx = ((uint32_t)stats->etx * (EWMA_SCALE - ewma_alpha) +
+        (uint32_t)packet_etx * ewma_alpha) / EWMA_SCALE;
+#endif /* LINK_STATS_ETX_WITH_EMANEXT */
+  }
+  stats->last_tx_time = curr_time;
+
+  LOG_DBG("To: ");
+  LOG_DBG_LLADDR(lladdr);
+  LOG_DBG_(" -> ETX = %d at timestamp %lu\n", packet_etx, stats->last_tx_time);
+#endif /* LINK_STATS_ETX_FROM_PACKET_COUNT */
+  LINK_STATS_FEATURES.link_features_on_tx(stats);
+}
+/*---------------------------------------------------------------------------*/
+/* Packet input callback. Updates statistics for receptions on a given link */
+void
+link_stats_input_callback(const linkaddr_t *lladdr)
+{
+  struct link_stats *stats;
+  int16_t packet_rssi = packetbuf_attr(PACKETBUF_ATTR_RSSI);
+
+  stats = nbr_table_get_from_lladdr(link_stats, lladdr);
+  if(stats == NULL) {
+    /* Add the neighbor */
+    stats = nbr_table_add_lladdr(link_stats, lladdr, NBR_TABLE_REASON_LINK_STATS, NULL);
+    if(stats == NULL) {
+      return; /* No space left, return */
+    }
+    initialize_stats(stats);
+  }
+
+  if(stats->rssi[0] == LINK_STATS_RSSI_UNKNOWN) {
+    /* Update last Rx timestamp */
+    stats->rx_time[0] = clock_time();
+    /* Initialize RSSI */
+    stats->rssi[0] = packet_rssi;
+    stats->rssi_smoothed = stats->rssi[0];
+  } else {
+    clock_time_t curr_time = clock_time();
+#if LINK_STATS_RSSI_WITH_EMANEXT
+    /* Update smoothed RSSI using EMAnext */
+    float diff_s = (float) (curr_time - stats->rx_time[0]) / CLOCK_SECOND;
+    stats->rssi_smoothed = (int16_t) emanext((float) stats->rssi_smoothed, (float) packet_rssi, diff_s, EMA_TAU_RSSI);
+#else
+    /* Update RSSI EWMA */
+    stats->rssi_smoothed = ((int32_t)stats->rssi_smoothed * (EWMA_SCALE - EWMA_ALPHA) +
+        (int32_t)packet_rssi * EWMA_ALPHA) / EWMA_SCALE;
+#endif
+    /* Update RSSI and Rx timestamp arrays */
+    for(uint8_t i = (LINK_STATS_RSSI_ARR_LEN - 1); i > 0; i--) {
+      stats->rx_time[i] = stats->rx_time[i-1];
+      stats->rssi[i] = stats->rssi[i-1];
+    }
+
+    /* Update last Rx timestamp */
+    stats->rx_time[0] = curr_time;
+    /* Update RSSI */
+    stats->rssi[0] = packet_rssi;
+
+    LOG_DBG("From: ");
+    LOG_DBG_LLADDR(lladdr);
+    LOG_DBG_(" -> RSSI = %d at timestamp %lu\n", stats->rssi[0], stats->rx_time[0]);
+  }
+
+  stats->link_stats_cost_updated = 0;
+
+  if(stats->etx == 0) {
+    /* Initialize ETX */
+#if LINK_STATS_INIT_ETX_FROM_RSSI
+    stats->etx = guess_etx_from_rssi(stats);
+#else /* LINK_STATS_INIT_ETX_FROM_RSSI */
+    stats->etx = ETX_DEFAULT * ETX_DIVISOR;
+#endif /* LINK_STATS_INIT_ETX_FROM_RSSI */
+  }
+
+#if LINK_STATS_PACKET_COUNTERS
+  stats->cnt_current.num_packets_rx++;
+#endif
+
+  LINK_STATS_FEATURES.link_features_on_rx(stats);
+}
+/*---------------------------------------------------------------------------*/
+#if LINK_STATS_PACKET_COUNTERS
+/*---------------------------------------------------------------------------*/
+static void
+print_and_update_counters(void)
+{
+  struct link_stats *stats;
+
+  for(stats = nbr_table_head(link_stats); stats != NULL;
+      stats = nbr_table_next(link_stats, stats)) {
+
+    struct link_packet_counter *c = &stats->cnt_current;
+
+    LOG_INFO("num packets: tx=%u ack=%u rx=%u queue_drops=%u to=",
+             c->num_packets_tx, c->num_packets_acked,
+             c->num_packets_rx, c->num_queue_drops);
+    LOG_INFO_LLADDR(link_stats_get_lladdr(stats));
+    LOG_INFO_("\n");
+
+    stats->cnt_total.num_packets_tx += stats->cnt_current.num_packets_tx;
+    stats->cnt_total.num_packets_acked += stats->cnt_current.num_packets_acked;
+    stats->cnt_total.num_packets_rx += stats->cnt_current.num_packets_rx;
+    stats->cnt_total.num_queue_drops += stats->cnt_current.num_queue_drops;
+    memset(&stats->cnt_current, 0, sizeof(stats->cnt_current));
+  }
+}
+/*---------------------------------------------------------------------------*/
+#endif /* LINK_STATS_PACKET_COUNTERS */
+/*---------------------------------------------------------------------------*/
+/* Periodic timer called at a period of FRESHNESS_HALF_LIFE */
+static void
+periodic(void *ptr)
+{
+  /* Age (by halving) freshness counter of all neighbors */
+  struct link_stats *stats;
+  ctimer_reset(&periodic_timer);
+  for(stats = nbr_table_head(link_stats); stats != NULL; stats = nbr_table_next(link_stats, stats)) {
+    stats->freshness >>= 1;
+  }
+
+#if LINK_STATS_PACKET_COUNTERS
+  print_and_update_counters();
+#endif
+}
+/*---------------------------------------------------------------------------*/
+/* Resets link-stats module */
+void
+link_stats_reset(void)
+{
+  struct link_stats *stats;
+  stats = nbr_table_head(link_stats);
+  while(stats != NULL) {
+    nbr_table_remove(link_stats, stats);
+    stats = nbr_table_next(link_stats, stats);
+  }
+  LINK_STATS_FEATURES.link_features_reset();
+}
+/*---------------------------------------------------------------------------*/
+/* Initializes link-stats module */
+void
+link_stats_init(void)
+{
+  nbr_table_register(link_stats, NULL);
+  ctimer_set(&periodic_timer, FRESHNESS_HALF_LIFE, periodic, NULL);
+  LINK_STATS_FEATURES.link_features_init();
+}
+/*---------------------------------------------------------------------------*/
+/* Update OF link metric */
+void
+link_stats_metric_update_callback(const linkaddr_t *lladdr, uint16_t cost)
+{
+  struct link_stats *stats;
+  stats = nbr_table_get_from_lladdr(link_stats, lladdr);
+  if(stats != NULL) {
+    stats->curr_link_cost = cost;
+    stats->link_stats_cost_updated = 1;
+  }
+}

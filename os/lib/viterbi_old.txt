@@ -1,0 +1,82 @@
+#include <float.h>
+#include "viterbi.h"
+
+#define MIN(a,b) ((a)<(b)?(a):(b))
+#define A(ctx,i,j) ((ctx)->A[(i)*(ctx)->num_states + (j)])
+
+/* Helper: argmax over float array */
+static uint8_t argmax(const float *v, uint8_t n)
+{
+  uint8_t best = 0;
+  float best_val = v[0];
+  for(uint8_t i = 1; i < n; i++) {
+    if(v[i] > best_val) {
+      best = i;
+      best_val = v[i];
+    }
+  }
+  return best;
+}
+
+void viterbi_init(viterbi_t *ctx,
+                  uint8_t num_states,
+                  const float *pi,
+                  const float *A)
+{
+  ctx->num_states = MIN(num_states, VITERBI_MAX_STATES);
+  ctx->pi = pi;
+  ctx->A = A;
+
+  // Initialize delta with initial probabilities
+  for(uint8_t i = 0; i < ctx->num_states; i++) {
+    ctx->delta[i] = pi[i];
+  }
+
+  // Clear scratch buffer
+  for(uint8_t i = 0; i < ctx->num_states; i++) {
+    ctx->delta_tmp[i] = 0.0f;
+  }
+}
+
+/*
+ * One Viterbi iteration:
+ * delta_new[j] = max_i [ delta[i] * A[i→j] ] * emission[j]
+ */
+void viterbi_step(viterbi_t *ctx, const float *emission)
+{
+  for(uint8_t j = 0; j < ctx->num_states; j++) {
+    float best = 0.0f;
+
+    for(uint8_t i = 0; i < ctx->num_states; i++) {
+      float candidate = ctx->delta[i] * A(ctx, i, j);
+      if(candidate > best) {
+        best = candidate;
+      }
+    }
+
+    ctx->delta_tmp[j] = best * emission[j];
+  }
+
+  // swap buffers
+  for(uint8_t i = 0; i < ctx->num_states; i++) {
+    ctx->delta[i] = ctx->delta_tmp[i];
+  }
+}
+
+uint8_t viterbi_state(const viterbi_t *ctx)
+{
+  return argmax(ctx->delta, ctx->num_states);
+}
+
+void viterbi_reset(viterbi_t *ctx)
+{
+  // Initialize delta with initial probabilities
+  for(uint8_t i = 0; i < ctx->num_states; i++) {
+    ctx->delta[i] = ctx->pi[i];
+  }
+
+  // Clear scratch buffer
+  for(uint8_t i = 0; i < ctx->num_states; i++) {
+    ctx->delta_tmp[i] = 0.0f;
+  }
+}
